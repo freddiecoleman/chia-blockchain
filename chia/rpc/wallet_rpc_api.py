@@ -843,14 +843,14 @@ class WalletRpcApi:
             raise ValueError("Wallet needs to be fully synced before combining coins")
 
         wallet_id = int(request["wallet_id"])
-        min_coin_amount = Decimal(request["min_coin_amount"])
-        excluded_amounts = request["excluded_amounts"]
-        number_of_coins = request["number_of_coins"]
-        max_amount = Decimal(request["max_amount"])
-        target_coin_amount = Decimal(request["target_coin_amount"])
+        min_coin_amount = Decimal(request.get("min_coin_amount", 0))
+        excluded_amounts = request.get("excluded_amounts", [])
+        number_of_coins = request.get("number_of_coins", 500)
+        max_amount = Decimal(request.get("max_amount", 0))
+        target_coin_amount = Decimal(request.get("target_coin_amount", 0))
         target_coin_ids: List[bytes32] = [bytes32.from_hexstr(coin_id) for coin_id in request["target_coin_ids"]]
-        largest = bool(request["largest"])
-        final_fee = uint64(int(Decimal(request["fee"]) * units["chia"]))
+        largest = bool(request.get("largest", False))
+        final_fee = uint64(int(Decimal(request.get("fee", 0)) * units["chia"]))
 
         if number_of_coins > 500:
             raise ValueError(f"{number_of_coins} coins is greater then the maximum limit of 500 coins.")
