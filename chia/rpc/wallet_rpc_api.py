@@ -3,12 +3,15 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from blspy import AugSchemeMPL, G1Element, G2Element, PrivateKey
 
 from chia.consensus.block_rewards import calculate_base_farmer_reward
+from chia.cmds.units import units
+from chia.cmds.wallet_funcs import get_mojo_per_unit, get_wallet_type, print_balance
 from chia.data_layer.data_layer_wallet import DataLayerWallet
 from chia.pools.pool_wallet import PoolWallet
 from chia.pools.pool_wallet_info import FARMING_TO_POOL, PoolState, PoolWalletInfo, create_pool_state
@@ -30,7 +33,7 @@ from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 from chia.util.byte_types import hexstr_to_bytes
 from chia.util.config import load_config
 from chia.util.errors import KeychainIsLocked
-from chia.util.ints import uint16, uint32, uint64
+from chia.util.ints import uint16, uint32, uint64, uint128
 from chia.util.keychain import bytes_to_mnemonic, generate_mnemonic
 from chia.util.path import path_from_root
 from chia.util.ws_message import WsRpcMessage, create_payload_dict
@@ -141,6 +144,7 @@ class WalletRpcApi:
             "/sign_message_by_id": self.sign_message_by_id,
             "/verify_signature": self.verify_signature,
             "/get_transaction_memo": self.get_transaction_memo,
+            "/combine_coins": self.combine_coins,
             # CATs and trading
             "/cat_set_name": self.cat_set_name,
             "/cat_asset_id_to_name": self.cat_asset_id_to_name,
@@ -834,6 +838,98 @@ class WalletRpcApi:
         for coin_id, memo_list in memos.items():
             response[coin_id.hex()] = [memo.hex() for memo in memo_list]
         return {transaction_id.hex(): response}
+
+    async def combine_coins(self, request: Dict) -> EndpointResult:
+        if await self.service.wallet_state_manager.synced() is False:
+            raise ValueError("Wallet needs to be fully synced before combining coins")
+
+        wallet_id = int(request["wallet_id"])
+        min_coin_amount = Decimal(request["min_coin_amount"])
+        excluded_amounts = request["excluded_amounts"]
+        number_of_coins = request["number_of_coins"]
+        max_amount = Decimal(request["max_amount"])
+        target_coin_amount = Decimal(request["target_coin_amount"])
+        target_coin_ids: List[bytes32] = [bytes32.from_hexstr(coin_id) for coin_id in request["target_coin_ids"]]
+        largest = bool(request["largest"])
+        final_fee = uint64(int(Decimal(request["fee"]) * units["chia"]))
+
+        if number_of_coins > 500:
+            raise ValueError(f"{number_of_coins} coins is greater then the maximum limit of 500 coins.")
+
+        wallet = self.service.wallet_state_manager.wallets[wallet_id]
+
+        try:
+            wallet_type = wallet.type()
+            mojo_per_unit = get_mojo_per_unit(wallet_type)
+        except LookupError:
+            raise ValueError(f"Wallet id: {wallet_id} not found.")
+
+        if await self.service.wallet_state_manager.synced() is False:
+            raise ValueError("Wallet not synced. Please wait.")
+        
+        is_xch: bool = wallet_type == WalletType.STANDARD_WALLET  # this lets us know if we are directly combining Chia
+        final_max_amount = uint64(int(max_amount * mojo_per_unit)) if not target_coin_ids else uint64(0)
+        final_min_coin_amount: uint64 = uint64(int(min_coin_amount * mojo_per_unit))
+        final_excluded_amounts: List[uint64] = [uint64(int(Decimal(amount) * mojo_per_unit)) for amount in excluded_amounts]
+        final_target_coin_amount = uint64(int(target_coin_amount * mojo_per_unit))
+
+        if final_target_coin_amount != 0:  # if we have a set target, just use standard coin selection.
+            async with self.service.wallet_state_manager.lock:
+                removals: Set[Coin] = await wallet.select_coins(
+                    amount=(final_target_coin_amount + final_fee) if is_xch else final_target_coin_amount,
+                    max_coin_amount=final_max_amount,
+                    min_coin_amount=final_min_coin_amount,
+                    excluded_coin_amounts=final_excluded_amounts + [final_target_coin_amount],  # dont reuse coins of same amount.
+                )
+        else:
+            spendable_coins = await self.get_spendable_coins({
+                "wallet_id": wallet_id,
+                "max_coin_amount": final_max_amount,
+                "min_coin_amount": final_min_coin_amount,
+                "excluded_coin_amounts": final_excluded_amounts,
+            })
+            conf_coins = spendable_coins["confirmed_records"]
+
+            if len(target_coin_ids) > 0:
+                conf_coins = [cr for cr in conf_coins if cr.name in target_coin_ids]
+
+            if len(conf_coins) == 0:
+                raise ValueError("No coins to combine.")
+
+            if len(conf_coins) == 1:
+                raise ValueError("Only one coin found, you need at least two coins to combine.")
+
+            if largest:
+                conf_coins.sort(key=lambda r: r.coin.amount, reverse=True)
+            else:
+                conf_coins.sort(key=lambda r: r.coin.amount)  # sort the smallest first
+
+            if number_of_coins < len(conf_coins):
+                conf_coins = conf_coins[:number_of_coins]
+
+            removals = [cr.coin for cr in conf_coins]
+
+        total_amount: uint128 = uint128(sum(coin.amount for coin in removals))
+
+        if is_xch and total_amount - final_fee <= 0:
+            raise ValueError("Total amount is less than 0 after fee, exiting.")
+
+        target_ph: bytes32 = decode_puzzle_hash(await self.get_next_address({
+            "wallet_id": wallet_id,
+            "new_address": False,
+        }))
+        additions = [{"amount": (total_amount - final_fee) if is_xch else total_amount, "puzzle_hash": target_ph}]
+        transaction: TransactionRecord = await self.send_transaction_multi({
+            "wallet_id": wallet_id,
+            "additions": additions,
+            "removals": removals,
+            "fee": final_fee,
+        })
+        tx_id = transaction.name.hex()
+
+        return {
+            "tx_id": tx_id
+        }
 
     async def get_transactions(self, request: Dict) -> EndpointResult:
         wallet_id = int(request["wallet_id"])
