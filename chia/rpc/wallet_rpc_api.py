@@ -11,7 +11,6 @@ from blspy import AugSchemeMPL, G1Element, G2Element, PrivateKey
 
 from chia.consensus.block_rewards import calculate_base_farmer_reward
 from chia.cmds.units import units
-from chia.cmds.wallet_funcs import get_mojo_per_unit, get_wallet_type, print_balance
 from chia.data_layer.data_layer_wallet import DataLayerWallet
 from chia.pools.pool_wallet import PoolWallet
 from chia.pools.pool_wallet_info import FARMING_TO_POOL, PoolState, PoolWalletInfo, create_pool_state
@@ -860,12 +859,19 @@ class WalletRpcApi:
 
         try:
             wallet_type = wallet.type()
-            mojo_per_unit = get_mojo_per_unit(wallet_type)
         except LookupError:
             raise ValueError(f"Wallet id: {wallet_id} not found.")
 
         if await self.service.wallet_state_manager.synced() is False:
             raise ValueError("Wallet not synced. Please wait.")
+
+        mojo_per_unit: int
+        if wallet_type in {WalletType.STANDARD_WALLET, WalletType.POOLING_WALLET, WalletType.DATA_LAYER}:
+            mojo_per_unit = units["chia"]
+        elif wallet_type == WalletType.CAT:
+            mojo_per_unit = units["cat"]
+        else:
+            raise LookupError(f"Operation is not supported for Wallet type {wallet_type.name}")
         
         is_xch: bool = wallet_type == WalletType.STANDARD_WALLET  # this lets us know if we are directly combining Chia
         final_max_amount = uint64(int(max_amount * mojo_per_unit)) if not target_coin_ids else uint64(0)
