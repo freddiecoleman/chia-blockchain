@@ -897,7 +897,7 @@ class WalletRpcApi:
             conf_coins = spendable_coins["confirmed_records"]
 
             if len(target_coin_ids) > 0:
-                conf_coins = [cr for cr in conf_coins if cr.name in target_coin_ids]
+                conf_coins = [cr for cr in conf_coins if Coin(bytes32.from_hexstr(cr["coin"]["parent_coin_info"][2:]), bytes32.from_hexstr(cr["coin"]["puzzle_hash"][2:]), uint64(int(Decimal(cr["coin"]["amount"])))) in target_coin_ids]
 
             if len(conf_coins) == 0:
                 raise ValueError("No coins to combine.")
